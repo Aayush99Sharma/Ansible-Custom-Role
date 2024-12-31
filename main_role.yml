@@ -1,0 +1,398 @@
+---
+- name: Create a VPC with subnets, route tables, and gateways
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Include VPC setup role
+      include_role:
+        name: vpc_setup
+
+    - name: Include key pair role
+      include_role:
+        name: key_pair
+
+    - name: Include security group role
+      include_role:
+        name: Security_Group
+
+    - name: Include rds instance
+      include_role:
+        name: rds_setup
+
+    - name: Include frontend instance
+      include_role:
+        name: frontend
+
+    # - name: Add frontend instance to Ansible inventory
+    #   include_role:
+    #     name: instance_to_ansible_inventry
+    #   vars:
+    #     server_ip: "{{ frontend_ip }}"
+    #     server_name: frontend_instance
+    
+    - name: Include backend instance
+      include_role:
+        name: backend
+
+    # - name: Add backend instance to Ansible inventory
+    #   include_role:
+    #     name: instance_to_ansible_inventry
+    #   vars:
+    #     server_ip: "{{ backend_private_ip }}"
+    #     server_name: backend_instance
+
+    - name: Add servers to dynamic inventory
+      include_role:
+        name: dynamic_inventory
+
+- name: Copy access_key.pem to Frontend
+  hosts: frontend
+  gather_facts: true
+  become: yes
+  vars:
+    key_file_path : "/home/ubuntu/role_access_key.pem"
+    frontend_key_path: "/home/ubuntu/role_access_key.pem"
+    key_file_owner: "ubuntu"
+    key_file_group: "ubuntu"
+    key_file_permissions: '0400'
+  tasks:
+    - name: Create the destination directory (if not exists)
+      file:
+        path: /home/ubuntu/.ssh
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Copy the access_key.pem file
+      copy:
+        src: "{{ key_file_path }}"
+        dest: "{{ frontend_key_path }}"
+        owner: "{{ key_file_owner }}"
+        group: "{{ key_file_group }}"
+        mode: "{{ key_file_permissions }}"
+
+- name: Setup Backend Server for AayushChatApp
+  hosts: backend
+  become: yes
+  gather_facts: yes
+  vars:
+    allow_world_readable_tmpfiles: true
+  
+  tasks:
+    - name: Add "AayushChatApp" user without a password
+      user:
+        name: AayushChatApp
+        create_home: yes
+        shell: /bin/bash
+
+    - name: Ensure no password is set for "AayushChatApp" user
+      command: passwd -d AayushChatApp
+        
+    - name: upgrade
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install Python and development tools using the custom module
+      apt:
+        name:
+          - python3-pip
+          - python3-venv
+          - git
+          - build-essential
+          - libmysqlclient-dev
+          - pkg-config
+          - python3-dbg
+        state: present
+
+    - name: Get Ubuntu release codename
+      command: lsb_release -sc
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Add "universe" repository
+      apt_repository:
+        repo: "deb http://archive.ubuntu.com/ubuntu {{ ubuntu_codename.stdout }} universe"
+        state: present
+
+    - name: Add "AayushChatApp" user to sudoers with NOPASSWD privileges
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^AayushChatApp'
+        line: 'AayushChatApp ALL=(ALL) NOPASSWD:ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Set home directory ownership and permissions for AayushChatApp
+      file:
+        path: /home/AayushChatApp
+        state: directory
+        owner: AayushChatApp
+        group: AayushChatApp
+        recurse: yes
+        mode: '0755'
+
+    - name: Copy RDS credentials to backend server
+      copy:
+        src: "/home/ubuntu/db_credentials.txt"
+        dest: "/home/AayushChatApp/db_credentials.txt"
+        owner: AayushChatApp
+        group: AayushChatApp
+        mode: '0644'
+      
+    - name: Create Python virtual environment for AayushChatApp
+      shell: |
+        python3 -m venv /home/AayushChatApp/venv
+      become: true
+      become_method: su
+      become_user: AayushChatApp
+      args:
+        creates: /home/AayushChatApp/venv
+
+    - name: Install dependencies inside virtual environment
+      shell: |
+        source /home/AayushChatApp/venv/bin/activate && \
+        sudo apt-get update && \
+        sudo apt-get install -y libpq-dev python3-dev build-essential && \
+        sudo apt-get update && \
+        sudo apt-get install -y mysql-client && \
+        pip install --upgrade pip && \
+        pip install Django && \
+        pip install mysqlclient && \
+        pip install wheel && \
+        pip install psycopg2-binary && \
+        pip install --upgrade pip setuptools wheel
+        pip install djangorestframework
+      become: true
+      become_method: su
+      become_user: AayushChatApp
+      args:
+        executable: /bin/bash
+
+    - name: Check if Django_Chatapp repository exists
+      stat:
+        path: "/Django_Chatapp/.git"
+      register: git_repo
+
+    - name: Ensure Django_Chatapp directory exists
+      file:
+        path: "/Django_Chatapp"
+        state: directory
+        owner: AayushChatApp
+        group: AayushChatApp
+        mode: '0777'
+        
+    - name: Clone the Django_Chatapp repository if not already cloned
+      git:
+        repo: "https://github.com/Aayush99Sharma/chatapp-modified-ubuntu-22.04"
+        dest: "/Django_Chatapp"  # Clone into home directory
+        update: yes
+        clone: yes
+      become: yes
+      become_user: AayushChatApp
+
+    - name: Activate virtual environment
+      raw: >
+        bash -c "source /home/AayushChatApp/venv/bin/activate && echo 'Virtual
+        environment activated for AayushChatApp user'"
+      become_user: AayushChatApp
+
+    - name: Install Python dependencies from requirements.txt
+      shell: |
+        source /home/AayushChatApp/venv/bin/activate && \
+        pip install -r /Django_Chatapp/requirements.txt
+      args:
+        executable: /bin/bash
+
+    - name: Change ownership of Django_Chatapp directory
+      file:
+        path: /Django_Chatapp
+        state: directory
+        owner: AayushChatApp
+        group: AayushChatApp
+        recurse: yes
+
+    - name: Check if settings.py file exists
+      stat:
+        path: /Django_Chatapp/fundoo/fundoo/settings.py
+      register: settings_file
+
+    - name: Remove existing DATABASES block
+      replace:
+        path: /Django_Chatapp/fundoo/fundoo/settings.py
+        regexp: |
+          (?s)# Database.*?#sagar kadam
+        replace: ""
+      when: settings_file.stat.exists
+
+    - name: Add the new DATABASES block
+      blockinfile:
+        path: /Django_Chatapp/fundoo/fundoo/settings.py
+        marker: "# Database"
+        block: |
+          # Database
+          DATABASES = {
+              'default': {
+                  'ENGINE': 'django.db.backends.mysql',
+                  'NAME': os.getenv('DB_NAME', ''),
+                  'USER': os.getenv('DB_USER', ''),
+                  'PASSWORD': os.getenv('DB_PASSWORD', ''),
+                  'HOST': os.getenv('DB_HOST', ''),
+                  'PORT': os.getenv('DB_PORT', ''),
+              }
+          }
+          #sagar kadam
+        state: present
+      when: settings_file.stat.exists
+
+    - name: Run makemigrations command
+      raw: bash -c "cd /Django_Chatapp/fundoo && /home/AayushChatApp/venv/bin/python3 manage.py makemigrations"
+
+    # - name: Copy RDS credentials to backend server
+    #   copy:
+    #     src: "/home/ubuntu/Ansible/db_credentials.txt "
+    #     dest: "/home/AayushChatApp/db_credentials.txt"
+    #     owner: AayushChatApp
+    #     group: AayushChatApp
+    #     mode: '0644'
+
+    - name: Read RDS credentials content from rds_data.txt
+      ansible.builtin.slurp:
+        src: /home/AayushChatApp/db_credentials.txt
+      register: rds_content
+
+    - name: Add RDS credentials content to .bashrc
+      blockinfile:
+        path: "/home/AayushChatApp/.bashrc"
+        state: present
+        block: "{{ rds_content.content | b64decode }}"
+      become: yes
+      become_user: AayushChatApp
+
+    - name: Decode RDS credentials
+      set_fact:
+        rds_credentials: "{{ rds_content.content | b64decode }}"
+
+    - name: Parse the RDS credentials (assuming a simple key-value format)
+      set_fact:
+        db_name: "{{ rds_credentials.split('\n')[0].split('=')[1] }}"  # Extract DB_NAME
+        db_user: "{{ rds_credentials.split('\n')[1].split('=')[1] }}"  # Extract DB_USER
+        db_password: "{{ rds_credentials.split('\n')[2].split('=')[1] }}"  # Extract DB_PASSWORD
+        db_host: "{{ rds_credentials.split('\n')[3].split('=')[1] }}"  # Extract DB_HOST
+        db_port: "{{ rds_credentials.split('\n')[4].split('=')[1] }}"  # Extract DB_PORT
+
+    - name: Debug the RDS credentials (Optional, to verify extraction)
+      debug:
+        msg:
+          - "DB Name: {{ db_name }}"
+          - "DB User: {{ db_user }}"
+          - "DB Password: {{ db_password }}"
+          - "DB Host: {{ db_host }}"
+          - "DB Port: {{ db_port }}"
+
+
+    - name: Run migrate command
+      shell: |
+        export DB_NAME="{{ db_name }}"
+        export DB_USER="{{ db_user }}"
+        export DB_PASSWORD="{{ db_password }}"
+        export DB_HOST="{{ db_host }}"
+        export DB_PORT="{{ db_port }}"
+        cd /Django_Chatapp/fundoo
+        /home/AayushChatApp/venv/bin/python3 manage.py migrate
+      args:
+        executable: /bin/bash
+
+    - name: Create the backend service configuration
+      template:
+        src: "/home/ubuntu/Backend.j2"
+        dest: /etc/systemd/system/django-backend.service
+        mode: '0644'
+      vars:
+        rds_content: "{{ rds_content }}"  # Pass the fetched RDS credentials to the template
+      become: yes
+
+    - name: Reload systemd daemon
+      command: systemctl daemon-reload
+
+    - name: Start and enable Django service
+      systemd:
+        name: django-backend
+        state: started
+        enabled: true
+
+    - name: Restart Django service explicitly
+      command: sudo systemctl restart django-backend.service
+
+- name: Frontend configuration
+  hosts: frontend
+  gather_facts: true
+  become: yes
+  tasks:
+    - name: Debug frontend IP
+      debug:
+        msg: "Frontend instance IP is {{ ansible_host }}"
+
+    - name: Debug groups to check if backend is added
+      debug:
+        var: groups['backend']
+
+    - name: Set backend IPs from inventory
+      set_fact:
+        backend_ip: "{{ groups['backend'] }}"  # Directly use the backend IPs from groups
+
+    - name: Debug backend IPs
+      debug:
+        msg: "Backend IPs are {{ backend_ip }}"
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Unlink the default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Create the Nginx configuration file from template
+      template:
+        src: /home/ubuntu/Nginx.j2
+        dest: /etc/nginx/sites-enabled/default
+        mode: '0644'
+      notify:
+        - restart nginx
+
+    - name: Unlink the default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Create the Nginx configuration file from template
+      template:
+        src: /home/ubuntu/Nginx.j2
+        dest: /etc/nginx/sites-enabled/default
+        mode: '0644'
+      notify:
+        - restart nginx
+
+    - name: Test Nginx configuration
+      command: nginx -t
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
